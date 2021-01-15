@@ -1,0 +1,135 @@
+#!/bin/bash
+
+export PYTHONIOENCODING=utf8
+
+function process_page {
+
+	RECEITA=$(curl -s my_url | grep "\"id\":\"$1\"")
+
+	if [[ ! -z $RECEITA ]]; then
+		echo "The index $1 was already fetched successfully. Skipping." | tee -a $(dirname $0)/log
+		SKIP_SLEEP=1
+		return
+	fi
+
+	EMPTYRECORD=$(curl -s my_url | grep "\"id\":\"$1\"")
+
+	if [[ ! -z $EMPTYRECORD ]]; then
+		echo "The index $1 was already fetched and it was an empty record. Skipping." | tee -a $(dirname $0)/log
+		SKIP_SLEEP=1
+		return
+	fi
+
+	LOWRANK=$(curl -s my_url | grep "\"id\":\"$1\"")
+
+	if [[ ! -z $LOWRANK ]]; then
+		echo "The index $1 was already fetched and it was a low rank. Skipping." | tee -a $(dirname $0)/log
+		SKIP_SLEEP=1
+		return
+	fi
+
+	cp $(dirname $0)/headers $(dirname $0)/headerstemp
+	DATADOME_COOKIE=$(cat /tmp/cookies.txt)
+	sed -i "$ s/$/$DATADOME_COOKIE/" $(dirname $0)/headerstemp
+
+	HEADERS=()
+	while read H; do
+		HEADERS+=(--header "$H")
+	done < $(dirname $0)/headerstemp
+
+	rm $(dirname $0)/headerstemp
+
+	wget -q "${HEADERS[@]}" "target_url" -O $(dirname $0)/latest.html
+
+	if [[ "$?" != "0" ]]; then
+		echo "Error fetching id $1" | tee -a $(dirname $0)/log
+		save_index $1
+		ERROR=1
+	else
+
+		PAGE_DATA=$(cat $(dirname $0)/latest.html | grep recipeIngredient -m 1)
+
+		if [[ ! -z $PAGE_DATA ]]; then
+
+			PAGE_DATA=$(cat fake | grep -o "{.*")
+			PAGE_DATA=${PAGE_DATA::-2}
+
+			RATE=$(echo $PAGE_DATA | jq '.aggregateRating.ratingValue')
+			REVIEW_COUNT=$(echo $PAGE_DATA | jq '.aggregateRating.reviewCount')
+
+			re="^[0-9]+([.][0-9]+)?$"
+
+			if ! [[ $RATE =~ $re || $REVIEW_COUNT =~ $re ]]; then
+				echo "Source data in bad format, skipping $1" | tee -a $(dirname $0)/log
+				save_index $1
+				ERROR=1
+				return
+			fi
+
+			if (( $(echo "$RATE < 4" | bc -l) || $(echo "$REVIEW_COUNT < 100" | bc -l)  )); then
+				echo "Low ranking or too few reviews, skipping $1" | tee -a $(dirname $0)/log
+				JSON="{\"id\":\"$1\"}"
+				curl -s -X POST my_url > /dev/null
+				return
+			fi
+
+			NAME=$(echo $PAGE_DATA | jq '.name' | tr -d '"')
+			NAME=$(python3 -c "print(u'$NAME')")
+
+			NAME_UPPER=${NAME^^}
+
+			IMAGE=$(echo $PAGE_DATA | jq '.image' | tr -d '"')
+
+			INGREDIENTS=$(echo $PAGE_DATA | jq '.recipeIngredient' | grep -o " .*" | tr -d '"')
+			INGREDIENTS=${INGREDIENTS//[$'\t\r\n']}
+
+			JSON="{\"id\":\"$1\",\"name\":\"$NAME\",\"ingredients\":\"[$NAME_UPPER] $INGREDIENTS\",\"image\":\"$IMAGE\"}"
+			#echo $JSON
+			curl -s -X POST my_url > /dev/null
+
+			echo "Inserted: $1 - $NAME" | tee -a $(dirname $0)/log
+
+		else
+			IS_BLOCK=$(cat $(dirname $0)/latest.html | grep "Busca por:")
+			echo "IS_BLOCK: $IS_BLOCK" | tee -a $(dirname $0)/log
+			if [[ ! -z $IS_BLOCK ]]; then
+				JSON="{\"id\":\"$1\"}"
+				curl -s -X POST my_url > /dev/null
+				echo "There is no record for $1" | tee -a $(dirname $0)/log
+			else
+				echo "Ops, was it a block? Id: $1" | tee -a $(dirname $0)/log
+				save_index $1
+				ERROR=1
+			fi
+		fi
+	fi
+}
+
+function save_index {
+	JSON="{\"id\":\"$1\"}"
+	curl -s -X POST my_url > /dev/null
+}
+
+ERROR=0
+NEXT_INDEX=$(curl -s -X GET my_url | cut -d'"' -f26)
+
+while true;
+do
+
+	SKIP_SLEEP=0
+
+	process_page $NEXT_INDEX
+
+	if (( $ERROR == 1 )); then
+		echo "Quitting the script." | tee -a $(dirname $0)/log
+		exit 0
+	fi
+
+	if (( $SKIP_SLEEP == 0 )); then
+		SLEEP_TIME=$[ ($RANDOM % 3) + 2]
+		echo "Sleeping for $SLEEP_TIME s" | tee -a $(dirname $0)/log
+		sleep $SLEEP_TIME
+	fi
+
+	NEXT_INDEX=$((NEXT_INDEX+1))
+done
